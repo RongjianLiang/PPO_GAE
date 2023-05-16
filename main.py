@@ -1,6 +1,5 @@
 import warnings
 
-warnings.filterwarnings('ignore')
 from pyvirtualdisplay import Display
 
 import copy
@@ -231,7 +230,7 @@ class RLDataset(IterableDataset):
         running_gae = torch.zeros((self.env.num_envs, 1), dtype=torch.float32, device=device)
         gae_b = torch.zeros_like(td_error_b)
 
-        for row in range(self.samples_per_epoch -1, -1, -1):
+        for row in range(self.samples_per_epoch - 1, -1, -1):
             running_gae = td_error_b[row] + (1 - done_b[row]) * self.gamma * self.lamb * running_gae
             gae_b[row] = running_gae
 
@@ -253,7 +252,92 @@ class RLDataset(IterableDataset):
 
 
 # TODO: create PPO with Generalized Advantage Estimation
+class PPO(LightningModule):
+    # shrink samples_per_epoch from 10 to 8 for limited GPU memory
+    def __init__(self, env_name, num_envs=2048, episode_length=1000,
+                 batch_size=1024, hidden_size=192, samples_per_epoch=10,
+                 policy_lr=1e-4, value_lr=1e-3, epoch_repeat=4, epsilon=0.3,
+                 gamma=0.99, lamb=0.95, entropy_coef=0.1, optim=AdamW):
+
+        super().__init__()
+
+        self.env = create_env(env_name, num_envs=num_envs, episode_length=episode_length)
+        test_env = gym.make(env_name, episode_length=episode_length)
+        test_env = to_torch.JaxToTorchWrapper(test_env, device=device)
+        self.test_env = NormalizeObservation(test_env)
+        self.test_env.obs_rms = self.env.obs_rms
+
+        obs_size = self.env.observation_space.shape[1]
+        action_dims = self.env.action_space.shape[1]
+
+        self.policy = GradientPolicy(obs_size, action_dims, hidden_size)
+        self.value_net = ValueNet(obs_size, hidden_size)
+        self.target_value_net = copy.deepcopy(self.value_net)
+
+        self.dataset = RLDataset(self.env, self.policy, self.target_value_net,
+                                 samples_per_epoch, gamma, lamb, epoch_repeat)
+
+        self.save_hyperparameters()
+        self.videos = []
+
+    def configure_optimizers(self):
+        value_opt = self.hparams.optim(self.value_net.parameters(), lr=self.hparams.value_lr)
+        policy_opt = self.hparams.optim(self.policy.parameters(), lr=self.hparams.policy_lr)
+        return value_opt, policy_opt
+
+    def train_dataloader(self):
+        return DataLoader(dataset=self.dataset, batch_size=self.hparams.batch_size)
+
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        obs_b, loc_b, scale_b, action_b, reward_b, gae_b, target_b = batch
+
+        state_values = self.value_net(obs_b)
+
+        if optimizer_idx == 0:
+            loss = F.smooth_l1_loss(state_values, target_b)
+            self.log("episode/Value Loss:", loss)
+            return loss
+
+        elif optimizer_idx == 1:
+
+            new_loc, new_scale = self.policy(obs_b)
+            dist = Normal(new_loc, new_scale)
+            log_prob = dist.log_prob(action_b).sum(dim=-1, keepdim=True)
+
+            prev_dist = Normal(loc_b, scale_b)
+            prev_log_prob = prev_dist.log_prob(action_b).sum(dim=-1, keepdim=True)
+
+            rho = torch.exp(log_prob - prev_log_prob)
+
+            surrogate_1 = rho * gae_b
+            surrogate_2 = rho.clip(1 - self.hparams.epsilon, 1 + self.hparams.epsilon) * gae_b
+            policy_loss = - torch.minimum(surrogate_1, surrogate_2)  # fix a negative sign here!!!
+            # use the minus sign so that optimization
+            # is in the right direction
+
+            entropy = dist.entropy().sum(dim=-1, keepdim=True)
+            loss = policy_loss - self.hparams.entropy_coef * entropy
+
+            self.log("episode/Policy Loss", policy_loss.mean())
+            self.log("episode/Entropy", entropy.mean())
+            self.log("episode/Reward", reward_b.mean())
+
+            return loss.mean()
+
+    def training_epoch_end(self, training_epoch_outputs):  # updating value network when epoch ends
+        self.target_value_net.load_state_dict(self.value_net.state_dict())
+
+        if self.current_epoch % 10 == 0:
+            average_return = test_agent(self.test_env, self.hparams.episode_length, self.policy, episodes=1)
+            self.log("average/Average Return: ", average_return)
+
+        if self.current_epoch % 50 == 0:
+            video = create_video(self.test_env, self.hparams.episode_length, policy=self.policy)
+            self.videos.append(video)
+
+
 def main():
+    warnings.filterwarnings('ignore')
     """set up virtual display"""
     Display(visible=False, size=(1400, 900)).start()
 
@@ -264,7 +348,7 @@ def main():
     # env = to_torch.JaxToTorchWrapper(env, device=device)
     # create_video(env, 1000)
     env = create_env("brax-halfcheetah-v0", num_envs=10)
-    obs = env.reset()
+    # obs = env.reset()
     # print("Num envs:    ", obs.shape[0], "Obs dimension:   ", obs.shape[1])
     # print("Action space: ", env.action_space)
     # next_obs, reward, done, info = env.step(env.action_space.sample())
@@ -277,6 +361,13 @@ def main():
     # print("info: ", info)
     # print("\n")
     # print("info keys: ", info.keys())
+    """
+    Launch the training process! 
+    """
+    algo = PPO("brax-halfcheetah-v0")
+    trainer = Trainer(gpus=num_gpus, max_epochs=500)
+
+    trainer.fit(algo)
 
 
 # Press the green button in the gutter to run the script.
